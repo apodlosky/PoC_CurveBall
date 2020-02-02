@@ -487,9 +487,11 @@ cleanUp:
 //
 bool modifyEcKey(EC_KEY *ecKey)
 {
-    if (optPrivateKey != NULL) {
+    // Check for user-specified private key
+    if (optPrivateKey != NULL && !BN_is_one(optPrivateKey)) {
         return setEcKeyCustom(ecKey, optPrivateKey);
     }
+
     return setEcKeyOne(ecKey);
 }
 
