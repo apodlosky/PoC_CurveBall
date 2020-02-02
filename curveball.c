@@ -152,31 +152,41 @@ cleanUp:
 }
 
 //
+// Prints an OpenSSL EC_KEY key to stdout.
+//
+void printEcKey(const EC_KEY *ecKey)
+{
+    EC_KEY_print_fp(stdout, ecKey, 0);
+
+    //ECParameters_print_fp(stdout, ecKey);
+}
+
+//
 // Reads an X.509 certificate (PEM format) from the specified file.
 // Note: The returned X509 pointer must be freed.
 //
 X509* readX509(const char *inputFile)
 {
-    BIO *fileIo;
     X509 *cert = NULL;
+    BIO *fileIo;
 
     fileIo = BIO_new(BIO_s_file());
     if (fileIo == NULL) {
         showSslError("BIO_new failed");
+        return NULL;
+    }
+
+    if (!BIO_read_filename(fileIo, inputFile)) {
+        showSslError("BIO_read_filename failed");
     }
     else {
-        if (!BIO_read_filename(fileIo, inputFile)) {
-            showSslError("BIO_read_filename failed");
+        cert = PEM_read_bio_X509(fileIo, NULL, 0, NULL);
+        if (cert == NULL) {
+            showSslError("PEM_read_bio_X509 failed");
         }
-        else {
-            cert = PEM_read_bio_X509(fileIo, NULL, 0, NULL);
-            if (cert == NULL) {
-                showSslError("PEM_read_bio_X509 failed");
-            }
-        }
-
-        BIO_free(fileIo);
     }
+
+    BIO_free(fileIo);
 
     return cert;
 }
@@ -186,7 +196,7 @@ X509* readX509(const char *inputFile)
 //
 bool isX509Ec(X509 *cert)
 {
-    EVP_PKEY *publicKey;
+    const EVP_PKEY *publicKey;
 
     publicKey = X509_get0_pubkey(cert);
     if (publicKey == NULL) {
@@ -200,29 +210,9 @@ bool isX509Ec(X509 *cert)
 }
 
 //
-// Determines if the given X509 ECC certificate uses GF(p).
+// Retrieves the public key from an X509 ECC certificate.
 //
-bool isX509EcGFp(X509 *cert)
-{
-    EVP_PKEY *publicKey;
-
-    publicKey = X509_get0_pubkey(cert);
-    if (publicKey == NULL) {
-        showSslError("X509_get0_pubkey failed");
-    }
-    else {
-        // TODO: check equation is GFp based
-        // get EC_GROUP and check method is not GF2m?
-        return true;
-    }
-
-    return false;
-}
-
-//
-// Retrieves the public key from an ECC certificate.
-//
-EC_KEY* getEcPublicKey(X509 *cert)
+EC_KEY* getX509EcPublicKey(X509 *cert)
 {
     EC_KEY *ecKey = NULL;
     EVP_PKEY *publicKey;
@@ -239,6 +229,37 @@ EC_KEY* getEcPublicKey(X509 *cert)
     }
 
     return ecKey;
+}
+
+//
+// Determines if the given EC key uses GF(p).
+//
+bool isEcKeyGFp(EC_KEY *ecKey)
+{
+    const EC_GROUP *ecGroup;
+    const EC_METHOD *ecMethod;
+    const EC_METHOD *ecMethodGF2m;
+    int fieldType;
+
+    ecGroup = EC_KEY_get0_group(ecKey);
+    if (ecGroup == NULL) {
+        showSslError("EC_KEY_get0_group failed");
+        return false;
+    }
+
+    ecMethod = EC_GROUP_method_of(ecGroup);
+    if (ecMethod == NULL) {
+        showSslError("EC_GROUP_method_of failed");
+        return false;
+    }
+
+    fieldType = EC_METHOD_get_field_type(ecMethod);
+
+    // Curve field must be a GFp based, NOT GF2m. Currently OpenSSL supports
+    // 6 GFp methods, but only one GF2m method
+    ecMethodGF2m = EC_GF2m_simple_method();
+
+    return fieldType != EC_METHOD_get_field_type(ecMethodGF2m);
 }
 
 //
@@ -480,29 +501,29 @@ bool verifyEcKey(EC_KEY *ecKey)
 //
 bool writeEcKey(EC_KEY *ecKey, char *outputFile)
 {
-    BIO *fileIo;
     bool result = false;
+    BIO *fileIo;
 
     fileIo = BIO_new(BIO_s_file());
     if (fileIo == NULL) {
         showSslError("BIO_new failed");
+        return false;
+    }
+
+    // BIO_write_filename() does not take a const char* for the path...
+    if (!BIO_write_filename(fileIo, outputFile)) {
+        showSslError("BIO_write_filename failed");
     }
     else {
-        // BIO_write_filename() does not take a const char* for the path...
-        if (!BIO_write_filename(fileIo, outputFile)) {
-            showSslError("BIO_write_filename failed");
+        if (!PEM_write_bio_ECPrivateKey(fileIo, ecKey, NULL, NULL, 0, NULL, NULL)) {
+            showSslError("PEM_write_bio_ECPrivateKey failed");
         }
         else {
-            if (!PEM_write_bio_ECPrivateKey(fileIo, ecKey, NULL, NULL, 0, NULL, NULL)) {
-                showSslError("PEM_write_bio_ECPrivateKey failed");
-            }
-            else {
-                result = true;
-            }
+            result = true;
         }
-
-        BIO_free(fileIo);
     }
+
+    BIO_free(fileIo);
 
     return result;
 }
@@ -535,15 +556,14 @@ int main(int argc, char *argv[])
         goto cleanUp;
     }
 
-    // TODO: implement check
-    if (!isX509EcGFp(cert)) {
-        printf("[!] Error, NOT an EC certificate using GF(p) curve\n");
+    printf("[-] Retrieving EC public key and parameters...\n");
+    ecKey = getX509EcPublicKey(cert);
+    if (ecKey == NULL) {
         goto cleanUp;
     }
 
-    printf("[-] Retrieving EC public key and parameters...\n");
-    ecKey = getEcPublicKey(cert);
-    if (ecKey == NULL) {
+    if (!isEcKeyGFp(ecKey)) {
+        printf("[!] Error, NOT an EC certificate using GF(p) curve\n");
         goto cleanUp;
     }
 
@@ -552,6 +572,10 @@ int main(int argc, char *argv[])
         goto cleanUp;
     }
 
+    if (optVerbose) {
+        printf("[-] Dumping EC key...\n");
+        printEcKey(ecKey);
+    }
 
     printf("[-] Verifying EC key...\n");
     if (!verifyEcKey(ecKey)) {
