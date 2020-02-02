@@ -384,6 +384,20 @@ bool setEcKeyCustom(EC_KEY *ecKey, const BIGNUM *bnPrivateKey)
     bnOrder = EC_GROUP_get0_order(ecOrigGroup);
     bnCofactor = EC_GROUP_get0_cofactor(ecOrigGroup);
 
+    printf("  [-] Verifying chosen private key...\n");
+
+    if (BN_cmp(bnPrivateKey, BN_value_one()) <= 0) {
+        printf("    [*] Error, private key must be greater than 1\n");
+        goto cleanUp;
+    }
+
+    if (BN_cmp(bnPrivateKey, (BIGNUM*)bnOrder) >= 1) {
+        printf("    [*] Error, private key must be less than curve order of ");
+        printBigNum(bnOrder);
+        putchar('\n');
+        goto cleanUp;
+    }
+
     printf("  [-] Creating new EC group over GF(p)...\n");
     ecGroup = EC_GROUP_new_curve_GFp(bnP, bnA, bnB, bnCtx);
     if (ecGroup == NULL) {
